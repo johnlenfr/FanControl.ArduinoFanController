@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.IO.Ports;
 using System.Threading;
@@ -164,6 +164,12 @@ namespace FanControl.ArduinoInterface
             }
         }
 
+        // Writable user directory, including when FanControl is installed in Program Files.
+        private static string UserDataDirectory => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "FanControl.ArduinoInterface"
+        );
+
         private string FindArduinoPort()
         {
             string autoPort = DetectArduinoUsbPort();
@@ -173,26 +179,34 @@ namespace FanControl.ArduinoInterface
                 return autoPort;
             }
 
-            // Keep arduino_port.txt as a fallback for the tested setup.
             try
             {
-                string path = Path.Combine(
-                    AppDomain.CurrentDomain.BaseDirectory,
-                    "Plugins",
-                    "arduino_port.txt"
-                );
-
+                // Only the per-user fallback port file is supported.
+                // Never read a legacy file from the FanControl Plugins directory.
+                string path = Path.Combine(UserDataDirectory, "arduino_port.txt");
                 if (!File.Exists(path))
                 {
-                    Log("No USB Arduino found and no arduino_port.txt present.");
+                    Log("No USB Arduino found and no fallback port file at " + path);
                     return null;
                 }
 
                 string port = File.ReadAllText(path).Trim();
                 if (string.IsNullOrWhiteSpace(port))
+                {
+                    Log("Configured port file is empty: " + path);
                     return null;
+                }
 
-                Log("Using configured fallback port: " + port);
+                // Fail early on stale configurations, rather than trying an
+                // unavailable COM port repeatedly.
+                if (!Array.Exists(SerialPort.GetPortNames(),
+                    p => string.Equals(p, port, StringComparison.OrdinalIgnoreCase)))
+                {
+                    Log("Configured COM port is not available: " + port + " (" + path + ")");
+                    return null;
+                }
+
+                Log("Using configured fallback port: " + port + " from " + path);
                 return port;
             }
             catch (Exception ex)
@@ -282,18 +296,18 @@ namespace FanControl.ArduinoInterface
         {
             try
             {
-                string path = Path.Combine(
-                    AppDomain.CurrentDomain.BaseDirectory,
-                    "Plugins",
-                    "ArduinoInterface.log"
-                );
+                Directory.CreateDirectory(UserDataDirectory);
+                string path = Path.Combine(UserDataDirectory, "ArduinoInterface.log");
                 File.AppendAllText(
                     path,
                     DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
                     " | " + message + Environment.NewLine
                 );
             }
-            catch { }
+            catch
+            {
+                // Logging must never prevent the fan controller from starting.
+            }
         }
 
         public void Close()
