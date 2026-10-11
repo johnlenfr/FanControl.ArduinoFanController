@@ -1,0 +1,16 @@
+# .NET
+**/bin/
+**/obj/
+.vs/
+
+# Fichiers temporaires
+*.bak
+*.tmp
+*.log
+*.pdb
+
+# Configuration locale
+arduino_port.txt
+
+# DLL tierce utilisée pour compiler
+src/Dlls/FanControl.Plugins.dll
