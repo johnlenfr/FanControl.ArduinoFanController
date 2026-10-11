@@ -11,6 +11,8 @@ namespace FanControl.ArduinoInterface
     {
         private SerialPort _serial;
         private ArduinoFanControlSensor[] _fans;
+        private ArduinoRpmSensor[] _rpmSensors;
+        private Timer _keepAliveTimer;
         private Timer _reconnectTimer;
 
         private readonly object _serialLock = new object();
@@ -32,6 +34,8 @@ namespace FanControl.ArduinoInterface
             Log("Plugin initialization started.");
             DetectAndConnectArduino();
             _reconnectTimer = new Timer(_ => CheckReconnect(), null, 5000, 5000);
+            // The Arduino switches to 50% after five seconds without a command.
+            _keepAliveTimer = new Timer(_ => KeepAlive(), null, 2000, 2000);
         }
 
         public void Load(IPluginSensorsContainer container)
@@ -47,7 +51,11 @@ namespace FanControl.ArduinoInterface
                 foreach (var fan in _fans)
                     container.ControlSensors.Add(fan);
 
-                Log(_fans.Length + " fan sensors loaded.");
+                if (_rpmSensors != null)
+                    foreach (var sensor in _rpmSensors)
+                        container.FanSensors.Add(sensor);
+
+                Log(_fans.Length + " controls and " + (_rpmSensors == null ? 0 : _rpmSensors.Length) + " RPM sensors loaded.");
             }
         }
 
@@ -123,6 +131,14 @@ namespace FanControl.ArduinoInterface
                             Log("Warning: fan count changed. Restart FanControl to reload sensors.");
                         }
 
+                        if (_rpmSensors == null)
+                        {
+                            _rpmSensors = new ArduinoRpmSensor[]
+                            {
+                                new ArduinoRpmSensor("arduino_rpm_1", "Arduino FAN 1 RPM", 1, () => _serial, _serialLock),
+                                new ArduinoRpmSensor("arduino_rpm_2", "Arduino FAN 2 RPM", 2, () => _serial, _serialLock)
+                            };
+                        }
                         foreach (var fan in _fans)
                             fan.Resend();
 
@@ -249,6 +265,19 @@ namespace FanControl.ArduinoInterface
             }
         }
 
+        private void KeepAlive()
+        {
+            try
+            {
+                lock (_serialLock)
+                {
+                    if (_serial == null || !_serial.IsOpen || _fans == null) return;
+                    foreach (var fan in _fans) fan.Resend();
+                }
+            }
+            catch (Exception ex) { Log("Keep-alive error: " + ex.Message); }
+        }
+
         private void Log(string message)
         {
             try
@@ -270,6 +299,7 @@ namespace FanControl.ArduinoInterface
         public void Close()
         {
             _reconnectTimer?.Dispose();
+            _keepAliveTimer?.Dispose();
             lock (_serialLock)
             {
                 try
@@ -285,11 +315,15 @@ namespace FanControl.ArduinoInterface
         public void Dispose() => Close();
     }
 
-    public class ArduinoFanControlSensor : IPluginControlSensor
+    public class ArduinoFanControlSensor : IPluginControlSensor2
     {
         public string Id { get; }
         public string Name { get; }
         public float? Value { get; private set; }
+
+        // Match exact Id values of the RPM sensors created by this plugin.
+        // Channels 3-5 have no TACH input, so remain unpaired.
+        public string PairedFanSensorId { get; }
 
         private readonly int _fanNumber;
         private readonly Func<SerialPort> _getSerial;
@@ -305,6 +339,9 @@ namespace FanControl.ArduinoInterface
             Id = id;
             Name = name;
             _fanNumber = fanNumber;
+            PairedFanSensorId = fanNumber == 1 ? "arduino_rpm_1"
+                              : fanNumber == 2 ? "arduino_rpm_2"
+                              : null;
             _getSerial = getSerial;
             _serialLock = serialLock;
             Value = 30;
@@ -343,4 +380,63 @@ namespace FanControl.ArduinoInterface
             }
         }
     }
+    // Read-only FanControl RPM sensor. Only channels 1 and 2 have TACH inputs.
+    public class ArduinoRpmSensor : IPluginSensor
+    {
+        public string Id { get; }
+        public string Name { get; }
+        public float? Value { get; private set; }
+
+        private readonly int _number;
+        private readonly Func<SerialPort> _serialProvider;
+        private readonly object _lock;
+        private long _lastPollTicks;
+
+        public ArduinoRpmSensor(string id, string name, int number,
+            Func<SerialPort> serialProvider, object serialLock)
+        {
+            Id = id;
+            Name = name;
+            _number = number;
+            _serialProvider = serialProvider;
+            _lock = serialLock;
+            Value = null;
+        }
+
+        public void Update()
+        {
+            // FanControl calls Update frequently; limit serial traffic to ~1 Hz.
+            long now = DateTime.UtcNow.Ticks;
+            if (now - _lastPollTicks < TimeSpan.TicksPerSecond) return;
+            lock (_lock)
+            {
+                now = DateTime.UtcNow.Ticks;
+                if (now - _lastPollTicks < TimeSpan.TicksPerSecond) return;
+                _lastPollTicks = now;
+                SerialPort port = _serialProvider();
+                if (port == null || !port.IsOpen) { Value = null; return; }
+                try
+                {
+                    // All read/write access shares the same lock as SET_FAN.
+                    port.WriteLine("GET_RPM:" + _number);
+                    string line = port.ReadLine().Trim();
+                    string prefix = "RPM:" + _number + ":";
+                    if (!line.StartsWith(prefix, StringComparison.Ordinal))
+                        throw new IOException("Unexpected RPM response: " + line);
+                    float parsed;
+                    if (!float.TryParse(line.Substring(prefix.Length),
+                        System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out parsed) || parsed < 0 || parsed > 20000)
+                        throw new IOException("Invalid RPM response: " + line);
+                    Value = parsed;
+                }
+                catch (Exception)
+                {
+                    Value = null;
+                }
+            }
+        }
+    }
+
 }
