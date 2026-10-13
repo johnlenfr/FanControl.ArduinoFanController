@@ -13,6 +13,8 @@
  * DS18B20 TEMP 1: A1, TEMP 2: A2; individual 4.7k pull-ups to 5V.
  * GET_TEMP:1/2 -> TEMP:1/2:<Celsius> or TEMP:1/2:ERR.
  * OLED SSD1306 128x64 I2C A4 SDA / A5 SCL; navigation switch D4 to GND.
+ * External +12V voltage monitor: 27k (+12V to sense) / 10k (sense to GND),
+ * sense via 47k series resistor to A0, 100nF from A0 to GND.
  */
 // 1 = OLED SSD1306 + bouton D4 + menu ; 0 = version sans ecran.
 // Mettre cette valeur a 0 pour ne pas compiler Wire/U8x8 et l'interface OLED.
@@ -41,6 +43,22 @@ const unsigned long COMMAND_TIMEOUT_MS = 5000UL;
 const unsigned long TACH_WINDOW_MS = 1000UL;
 const unsigned long MIN_TACH_US = 8000UL;
 const uint8_t PULSES_PER_REV = 2;
+const uint8_t SUPPLY_SENSE_PIN = A0;
+// Calibrate ADC reference if measured Arduino 5V differs from 5.000V.
+// Resistor divider: 27k top / 10k bottom; ADC input = supply * 10/37.
+// A0 conversion reference, adjustable in the OLED menu (not physical VCC).
+const uint16_t VREF_DEFAULT_MV = 5000;
+const uint16_t VREF_MIN_MV = 4500;
+const uint16_t VREF_MAX_MV = 5200;
+const uint8_t VREF_STEP_MV = 10;
+uint16_t adcReferenceMv = VREF_DEFAULT_MV;
+const uint32_t DIVIDER_TOP_OHMS = 27000UL;
+const uint32_t DIVIDER_BOTTOM_OHMS = 10000UL;
+const unsigned long VOLTAGE_SAMPLE_MS = 500UL;
+uint16_t supplyMillivolts = 0;
+bool supplyReadingReady = false;
+unsigned long lastVoltageSampleMs = 0;
+
 
 #if ENABLE_OLED
 // SSD1306 128x64 OLED via I2C: A4=SDA, A5=SCL.
@@ -66,9 +84,20 @@ struct StoredSettings {
   uint8_t timeout;      // index into timeoutSeconds; 0xFFFFFFFF = always on
   uint8_t check;
 };
+// Version 2 appends the ADC reference; old v1 settings remain readable.
+struct StoredSettingsV2 {
+  uint8_t magic1;
+  uint8_t magic2;
+  uint8_t version;
+  uint8_t failsafe;
+  uint8_t brightness;
+  uint8_t timeout;
+  uint8_t check;
+  uint16_t vrefMv;
+};
 const uint8_t EEPROM_MAGIC1 = 0xF3;
 const uint8_t EEPROM_MAGIC2 = 0x62;
-const uint8_t EEPROM_FORMAT = 1;
+const uint8_t EEPROM_FORMAT = 2;
 const uint8_t failsafeChoices[] = {20, 30, 40, 50, 60, 70, 80, 90, 100};
 const uint8_t brightnessChoices[] = {10, 25, 50, 75, 100};
 const uint8_t contrastTable[] = {12, 40, 96, 170, 255};
@@ -98,18 +127,28 @@ unsigned long lastSerialCommandMs = 0;
 bool serialCommandSeen = false;
 
 enum UiMode : uint8_t { UI_PAGES, UI_MENU, UI_OLED_MENU, UI_CHOICES, UI_FW_INFO };
-enum ChoiceKind : uint8_t { CHOICE_FAILSAFE, CHOICE_BRIGHTNESS, CHOICE_TIMEOUT };
+enum ChoiceKind : uint8_t { CHOICE_FAILSAFE, CHOICE_BRIGHTNESS, CHOICE_TIMEOUT, CHOICE_VREF };
 UiMode uiMode = UI_PAGES;
 ChoiceKind choiceKind = CHOICE_FAILSAFE;
 uint8_t menuIndex = 0;
 uint8_t oledMenuIndex = 0;
 uint8_t choiceIndex = 0;
+uint16_t vrefChoiceMv = VREF_DEFAULT_MV;
 
 #endif
 
 uint8_t settingsCheck(const StoredSettings& s) {
   return (uint8_t)(0xA7 ^ s.magic1 ^ s.magic2 ^ s.version ^
                    s.failsafe ^ s.brightness ^ s.timeout);
+}
+uint8_t settingsCheckV2(const StoredSettingsV2& s) {
+  return (uint8_t)(0xA7 ^ s.magic1 ^ s.magic2 ^ s.version ^
+                   s.failsafe ^ s.brightness ^ s.timeout ^
+                   (uint8_t)s.vrefMv ^ (uint8_t)(s.vrefMv >> 8));
+}
+bool settingsValuesValid(uint8_t failsafe, uint8_t brightness, uint8_t timeout) {
+  return failsafe >= 20 && failsafe <= 100 &&
+         brightness < sizeof(brightnessChoices) && timeout < TIMEOUT_COUNT;
 }
 void setFailsafePercent(uint8_t percent) {
   failsafePercent = percent;
@@ -119,24 +158,44 @@ void loadSettings() {
   StoredSettings s;
   EEPROM.get(0, s);
   if (s.magic1 == EEPROM_MAGIC1 && s.magic2 == EEPROM_MAGIC2 &&
-      s.version == EEPROM_FORMAT && s.check == settingsCheck(s) &&
-      s.failsafe >= 20 && s.failsafe <= 100 &&
-      s.brightness < sizeof(brightnessChoices) && s.timeout < TIMEOUT_COUNT) {
-    setFailsafePercent(s.failsafe);
-    brightnessIndex = s.brightness;
-    timeoutIndex = s.timeout;
-  } else {
-    setFailsafePercent(FACTORY_FAILSAFE_PERCENT);
-    brightnessIndex = 3;
-    timeoutIndex = TIMEOUT_COUNT - 1;
+      settingsValuesValid(s.failsafe, s.brightness, s.timeout)) {
+    if (s.version == EEPROM_FORMAT) {
+      StoredSettingsV2 v2;
+      EEPROM.get(0, v2);
+      if (v2.check == settingsCheckV2(v2) &&
+          v2.vrefMv >= VREF_MIN_MV && v2.vrefMv <= VREF_MAX_MV &&
+          (v2.vrefMv % VREF_STEP_MV) == 0) {
+        setFailsafePercent(v2.failsafe);
+        brightnessIndex = v2.brightness;
+        timeoutIndex = v2.timeout;
+        adcReferenceMv = v2.vrefMv;
+        return;
+      }
+    } else if (s.version == 1 && s.check == settingsCheck(s)) {
+      // One-time migration: preserve previous failsafe/OLED settings.
+      setFailsafePercent(s.failsafe);
+      brightnessIndex = s.brightness;
+      timeoutIndex = s.timeout;
+      adcReferenceMv = VREF_DEFAULT_MV;
+      return;
+    }
   }
+  setFailsafePercent(FACTORY_FAILSAFE_PERCENT);
+  brightnessIndex = 3;
+  timeoutIndex = TIMEOUT_COUNT - 1;
+  adcReferenceMv = VREF_DEFAULT_MV;
 }
 void saveSettings() {
-  StoredSettings s = {EEPROM_MAGIC1, EEPROM_MAGIC2, EEPROM_FORMAT,
-                      failsafePercent, brightnessIndex, timeoutIndex, 0};
-  s.check = settingsCheck(s);
+  StoredSettingsV2 s = {EEPROM_MAGIC1, EEPROM_MAGIC2, EEPROM_FORMAT,
+                        failsafePercent, brightnessIndex, timeoutIndex, 0,
+                        adcReferenceMv};
+  s.check = settingsCheckV2(s);
   const uint8_t* p = (const uint8_t*)&s;
-  for (uint8_t i = 0; i < sizeof(s); ++i) EEPROM.update(i, p[i]);
+  // Write version LAST: interrupted writes cannot validate as v2.
+  for (uint8_t i = 0; i < sizeof(s); ++i) {
+    if (i != 2) EEPROM.update(i, p[i]);
+  }
+  EEPROM.update(2, s.version);
 }
 #if ENABLE_OLED
 void forceOledRedraw() {
@@ -213,6 +272,22 @@ void applyPWM(uint8_t channel, uint8_t value) {
   analogWrite(fanPins[channel], (uint8_t)(255 - value));
 }
 
+// One short ADC conversion every 500 ms; no delay() or averaging loop.
+// The 100nF capacitor on A0 filters the divider/47k series resistance.
+void updateSupplyVoltage() {
+  unsigned long now = millis();
+  if (supplyReadingReady &&
+      (unsigned long)(now - lastVoltageSampleMs) < VOLTAGE_SAMPLE_MS) return;
+  lastVoltageSampleMs = now;
+  uint16_t adc = analogRead(SUPPLY_SENSE_PIN);
+  // 32-bit integer calculation avoids float code and SRAM overhead.
+  // 5000 mV reference gives 18500 mV full scale; adjustable via EEPROM.
+  uint32_t fullScaleMv = (uint32_t)adcReferenceMv *
+      (DIVIDER_TOP_OHMS + DIVIDER_BOTTOM_OHMS) / DIVIDER_BOTTOM_OHMS;
+  supplyMillivolts = (uint16_t)(((uint32_t)adc * fullScaleMv + 511UL) / 1023UL);
+  supplyReadingReady = true;
+}
+
 void updateRpm() {
   unsigned long now = millis();
   unsigned long elapsed = now - lastRpmMs;
@@ -266,15 +341,21 @@ void updateTemperatures() {
 uint8_t choiceCount() {
   if (choiceKind == CHOICE_FAILSAFE) return sizeof(failsafeChoices);
   if (choiceKind == CHOICE_BRIGHTNESS) return sizeof(brightnessChoices);
+  if (choiceKind == CHOICE_VREF) return (VREF_MAX_MV - VREF_MIN_MV) / VREF_STEP_MV + 1;
   return TIMEOUT_COUNT;
 }
 void shortPress() {
   lastUserInteractionMs = millis();
   switch (uiMode) {
     case UI_PAGES: oledPage = (uint8_t)((oledPage + 1) % OLED_PAGE_COUNT); break;
-    case UI_MENU: menuIndex = (uint8_t)((menuIndex + 1) % 4); break;
+    case UI_MENU: menuIndex = (uint8_t)((menuIndex + 1) % 5); break;
     case UI_OLED_MENU: oledMenuIndex = (uint8_t)((oledMenuIndex + 1) % 3); break;
-    case UI_CHOICES: choiceIndex = (uint8_t)((choiceIndex + 1) % choiceCount()); break;
+    case UI_CHOICES:
+      if (choiceKind == CHOICE_VREF) {
+        vrefChoiceMv += VREF_STEP_MV;
+        if (vrefChoiceMv > VREF_MAX_MV) vrefChoiceMv = VREF_MIN_MV;
+      } else choiceIndex = (uint8_t)((choiceIndex + 1) % choiceCount());
+      break;
     case UI_FW_INFO: uiMode = UI_MENU; break;
   }
   // Only redraw rows whose text changes; no clearing on selection.
@@ -283,7 +364,9 @@ void beginChoices(ChoiceKind kind) {
   choiceKind = kind;
   uiMode = UI_CHOICES;
   choiceIndex = 0;
-  if (kind == CHOICE_FAILSAFE) {
+  if (kind == CHOICE_VREF) {
+    vrefChoiceMv = adcReferenceMv;
+  } else if (kind == CHOICE_FAILSAFE) {
     for (uint8_t i = 0; i < choiceCount(); ++i)
       if (failsafeChoices[i] == failsafePercent) choiceIndex = i;
   } else if (kind == CHOICE_BRIGHTNESS) choiceIndex = brightnessIndex;
@@ -298,8 +381,9 @@ void longPress() {
   } else if (uiMode == UI_MENU) {
     switch (menuIndex) {
       case 0: beginChoices(CHOICE_FAILSAFE); break;
-      case 1: uiMode = UI_FW_INFO; break;
-      case 2: uiMode = UI_OLED_MENU; oledMenuIndex = 0; break;
+      case 1: uiMode = UI_OLED_MENU; oledMenuIndex = 0; break;
+      case 2: beginChoices(CHOICE_VREF); break;
+      case 3: uiMode = UI_FW_INFO; break;
       default: uiMode = UI_PAGES; break;
     }
   } else if (uiMode == UI_OLED_MENU) {
@@ -321,9 +405,13 @@ void longPress() {
       brightnessIndex = choiceIndex;
       applyBrightness();
       uiMode = UI_OLED_MENU;
-    } else {
+    } else if (choiceKind == CHOICE_TIMEOUT) {
       timeoutIndex = choiceIndex;
       uiMode = UI_OLED_MENU;
+    } else {
+      adcReferenceMv = vrefChoiceMv;
+      supplyReadingReady = false;  // Recompute supply with the new calibration.
+      uiMode = UI_MENU;
     }
     saveSettings();
   } else if (uiMode == UI_FW_INFO) uiMode = UI_MENU;
@@ -356,6 +444,16 @@ void updateOledButton() {
     buttonLongConsumed = true;
     longPress();
   }
+}
+
+// Approximate free SRAM at this point: distance between heap and stack.
+// AVR ATmega328P only; no heap allocation or large screen buffer needed.
+extern unsigned int __heap_start;
+extern void *__brkval;
+int freeRam() {
+  uint8_t stackMarker;
+  return (int)(&stackMarker) -
+         (int)(__brkval ? __brkval : (void *)&__heap_start);
 }
 
 // U8x8: 16x8 characters. 32 bytes of hashes replace a 136-byte row cache.
@@ -419,14 +517,14 @@ void updateOled() {
   // Redraw all 8 rows logically, including blanks. Only changed rows
   // are actually sent over I2C. This prevents stale text between views.
   if (uiMode == UI_MENU) {
-    OLED_TEXT(0, "      MENU      ");
-    OLED_TEXT(1, "");
-    for (uint8_t i = 0; i < 4; ++i) {
+    OLED_TEXT(0, "MENU CONFIG");
+    for (uint8_t i = 0; i < 5; ++i) {
       const __FlashStringHelper* label;
       switch (i) {
         case 0: label = F("PWM FAILSAFE"); break;
-        case 1: label = F("FIRMWARE INFO"); break;
-        case 2: label = F("OLED SETTINGS"); break;
+        case 1: label = F("OLED SETTINGS"); break;
+        case 2: label = F("ADC VREF"); break;
+        case 3: label = F("FW INFOS"); break;
         default: label = F("EXIT"); break;
       }
       char text[17];
@@ -434,8 +532,10 @@ void updateOled() {
       text[16] = '\0';
       text[0] = menuIndex == i ? '>' : ' ';
       text[1] = ' ';
-      drawOledRow(i + 2, text);
+      drawOledRow(i + 1, text);
     }
+    // Write each row only once; previously row 1 was blanked then redrawn,
+    // which caused visible flicker even with the row-hash cache.
     OLED_TEXT(6, "SHORT: SELECT");
     OLED_TEXT(7, "LONG: ENTER");
   } else if (uiMode == UI_OLED_MENU) {
@@ -472,42 +572,41 @@ void updateOled() {
       OLED_TEXT(0, "OLED BRIGHTNESS");
       snprintf(line, sizeof(line), "> %u %%", brightnessChoices[choiceIndex]);
       drawOledRow(3, line);
-    } else {
+    } else if (choiceKind == CHOICE_TIMEOUT) {
       OLED_TEXT(0, " OLED AUTO OFF  ");
       drawTimeoutChoice(3, choiceIndex);
+    } else {
+      OLED_TEXT(0, "    ADC VREF    ");
+      snprintf(line, sizeof(line), "> %u.%03u V",
+               (unsigned)(vrefChoiceMv / 1000U),
+               (unsigned)(vrefChoiceMv % 1000U));
+      drawOledRow(3, line);
     }
     OLED_TEXT(1, ""); OLED_TEXT(2, "");
     OLED_TEXT(4, ""); OLED_TEXT(5, "");
     OLED_TEXT(6, "SHORT: SELECT");
     OLED_TEXT(7, "LONG: CONFIRM");
   } else if (oledPage == 0) {
-    OLED_TEXT(0, "FANS         1/3");
+    OLED_TEXT(0, "FANS STATUS  1/3");
     OLED_TEXT(1, "");
     for (uint8_t i = 0; i < FAN_COUNT; ++i) {
-      // FanControl sends 0..255; display 0.0..99.9%, or "100%".
-      // Integer arithmetic avoids printf's floating-point support on AVR.
-      const unsigned tenths = (unsigned)((pwmValues[i] * 1000UL + 127UL) / 255UL);
-      char pctText[7];
-      if (tenths >= 1000U) {
-        strcpy(pctText, "100%");
-      } else {
-        snprintf(pctText, sizeof(pctText), "%u.%u%%", tenths / 10U, tenths % 10U);
-      }
+      // Round PWM duty cycle to the nearest whole percent (0..100).
+      // Integer-only calculation keeps AVR code small.
+      const unsigned percent = (unsigned)((pwmValues[i] * 100UL + 127UL) / 255UL);
       if (i < 2) {
         if (rpmWindowReady) {
-          unsigned long measuredRpm = (unsigned long)(rpm[i] + 0.5f);
-          // 16-character OLED: "F1  99.6% 1234RPM" (no space before RPM).
+          const unsigned long measuredRpm = (unsigned long)(rpm[i] + 0.5f);
+          // Maximum of 16 characters on the 128x64 U8x8 text display.
           if (measuredRpm <= 9999UL) {
-            snprintf(line, sizeof(line), "F%u %5s %4luRPM", (unsigned)(i + 1), pctText, measuredRpm);
+            snprintf(line, sizeof(line), "%u: %3u%% %4luRPM", (unsigned)(i + 1), percent, measuredRpm);
           } else {
-            // Rare overflow: show RPM number without unit, not a truncated unit.
-            snprintf(line, sizeof(line), "F%u %5s %5lu", (unsigned)(i + 1), pctText, measuredRpm);
+            snprintf(line, sizeof(line), "%u: %3u%% %5lu", (unsigned)(i + 1), percent, measuredRpm);
           }
         } else {
-          snprintf(line, sizeof(line), "F%u %5s %4sRPM", (unsigned)(i + 1), pctText, "--");
+          snprintf(line, sizeof(line), "%u: %3u%% %4sRPM", (unsigned)(i + 1), percent, "--");
         }
       } else {
-        snprintf(line, sizeof(line), "F%u %5s", (unsigned)(i + 1), pctText);
+        snprintf(line, sizeof(line), "%u: %3u%%", (unsigned)(i + 1), percent);
       }
       drawOledRow(i + 2, line);
     }
@@ -529,10 +628,22 @@ void updateOled() {
       snprintf(line, sizeof(line), "LAST RX: %lus", seconds);
       drawOledRow(3, line);
     } else OLED_TEXT(3, "LAST RX: --");
-    OLED_TEXT(4, "");
     snprintf(line, sizeof(line), "PWM SAFE: %u%%", failsafePercent);
-    drawOledRow(5, line);
-    OLED_TEXT(6, "");
+    drawOledRow(4, line);
+    if (supplyReadingReady) {
+      // One decimal digit; -- before the first conversion.
+      uint16_t tenths = (uint16_t)((supplyMillivolts + 50U) / 100U);
+      snprintf(line, sizeof(line), "12V INPUT: %u.%uV",
+               (unsigned)(tenths / 10U), (unsigned)(tenths % 10U));
+      drawOledRow(5, line);
+    } else {
+      OLED_TEXT(5, "12V INPUT: --");
+    }
+    // Diagnostic: estimated free SRAM between heap and stack.
+    // Updated only with the usual OLED refresh, without delays.
+    const int availableRam = freeRam();
+    snprintf(line, sizeof(line), "FREE RAM: %dB", availableRam);
+    drawOledRow(6, line);
     OLED_TEXT(7, "MENU: LONG PRESS");
   }
   oledDirty = false;
@@ -551,11 +662,11 @@ void processCommand(char* line) {
   } else if (strcmp(line, "NUM_FANS") == 0) {
     Serial.println(FAN_COUNT);
   } else if (strcmp(line, "FAN_NAMES") == 0) {
-    Serial.println(F("Ardui1-Output5"));
-    Serial.println(F("Ardui2-Output6"));
-    Serial.println(F("Ardui3-Output9"));
-    Serial.println(F("Ardui4-Output10"));
-    Serial.println(F("Ardui5-Output11"));
+    Serial.println(F("Arduino FAN 1 PWM"));
+    Serial.println(F("Arduino FAN 2 PWM"));
+    Serial.println(F("Arduino FAN 3 PWM"));
+    Serial.println(F("Arduino FAN 4 PWM"));
+    Serial.println(F("Arduino FAN 5 PWM"));
   } else if (strncmp(line, "SET_FAN:", 8) == 0) {
     char* endIndex;
     long index = strtol(line + 8, &endIndex, 10);
@@ -647,6 +758,7 @@ void loop() {
       lastCommandMs[i] = now;
     }
   }
+  updateSupplyVoltage();
   // OLED last: priority to serial commands, RPM and fail-safe.
 #if ENABLE_OLED
   updateMenuTimeout();

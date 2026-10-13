@@ -151,8 +151,8 @@ namespace FanControl.ArduinoInterface
                         {
                             _temperatureSensors = new ArduinoTemperatureSensor[]
                             {
-                                new ArduinoTemperatureSensor("arduino_temp_1", "Arduino TEMP 1 (A1)", 1, () => _serial, _serialLock),
-                                new ArduinoTemperatureSensor("arduino_temp_2", "Arduino TEMP 2 (A2)", 2, () => _serial, _serialLock)
+                                new ArduinoTemperatureSensor("arduino_temp_1", "Arduino TEMP 1", 1, () => _serial, _serialLock),
+                                new ArduinoTemperatureSensor("arduino_temp_2", "Arduino TEMP 2", 2, () => _serial, _serialLock)
                             };
                         }
                         foreach (var fan in _fans)
