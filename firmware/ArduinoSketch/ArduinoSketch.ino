@@ -10,10 +10,14 @@
  * USB serial protocol: PING, NUM_FANS, FAN_NAMES,
  * SET_FAN:<1..5>:<0..255>, GET_RPM:<1..5>.
  * Only FAN 1 and 2 have tach sensors. Other GET_RPM returns -1.
+ * DS18B20 TEMP 1: A1, TEMP 2: A2; individual 4.7k pull-ups to 5V.
+ * GET_TEMP:1/2 -> TEMP:1/2:<Celsius> or TEMP:1/2:ERR.
  */
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 const uint8_t FAN_COUNT = 5;
 const uint8_t fanPins[FAN_COUNT] = {5, 6, 9, 10, 11};
@@ -27,6 +31,22 @@ const unsigned long COMMAND_TIMEOUT_MS = 5000UL;
 const unsigned long TACH_WINDOW_MS = 1000UL;
 const unsigned long MIN_TACH_US = 8000UL;
 const uint8_t PULSES_PER_REV = 2;
+
+// Two independent powered (three-wire) DS18B20 buses.
+const uint8_t TEMP_COUNT = 2;
+const uint8_t tempPins[TEMP_COUNT] = {A1, A2};
+OneWire oneWireTemp1(A1);
+OneWire oneWireTemp2(A2);
+DallasTemperature tempSensor1(&oneWireTemp1);
+DallasTemperature tempSensor2(&oneWireTemp2);
+DallasTemperature* const tempSensors[TEMP_COUNT] = {&tempSensor1, &tempSensor2};
+const unsigned long TEMP_CONVERSION_MS = 750UL;  // 12-bit DS18B20 max conversion time
+const unsigned long TEMP_SAMPLE_INTERVAL_MS = 1000UL;
+float tempC[TEMP_COUNT] = {0.0f, 0.0f};
+bool tempValid[TEMP_COUNT] = {false, false};
+bool tempConversionPending = false;
+unsigned long tempConversionStartedMs = 0;
+unsigned long lastTempSampleMs = 0;
 
 uint8_t pwmValues[FAN_COUNT];
 unsigned long lastCommandMs[FAN_COUNT];
@@ -76,6 +96,35 @@ void updateRpm() {
   lastRpmMs = now;
 }
 
+void startTemperatureConversion(unsigned long now) {
+  // Request both conversions without holding up serial, RPM or PWM safety code.
+  for (uint8_t i = 0; i < TEMP_COUNT; ++i)
+    tempSensors[i]->requestTemperatures();
+  tempConversionStartedMs = now;
+  tempConversionPending = true;
+}
+
+void updateTemperatures() {
+  unsigned long now = millis();
+  if (tempConversionPending) {
+    if ((unsigned long)(now - tempConversionStartedMs) < TEMP_CONVERSION_MS)
+      return;
+    for (uint8_t i = 0; i < TEMP_COUNT; ++i) {
+      float value = tempSensors[i]->getTempCByIndex(0);
+      // DallasTemperature reports -127 C on disconnect and 85 C may be
+      // a power-on default rather than a completed conversion.
+      tempValid[i] = value != DEVICE_DISCONNECTED_C && value != 85.0f &&
+                     value >= -55.0f && value <= 125.0f;
+      if (tempValid[i]) tempC[i] = value;
+    }
+    tempConversionPending = false;
+    lastTempSampleMs = now;
+  }
+  if (!tempConversionPending &&
+      (unsigned long)(now - lastTempSampleMs) >= TEMP_SAMPLE_INTERVAL_MS)
+    startTemperatureConversion(now);
+}
+
 void processCommand(char* line) {
   if (strcmp(line, "PING") == 0) {
     Serial.println(F("PONG"));
@@ -102,6 +151,16 @@ void processCommand(char* line) {
     Serial.print(':');
     if (index <= 2) Serial.println(rpm[index - 1], 1);
     else Serial.println(-1);
+  } else if (strncmp(line, "GET_TEMP:", 9) == 0) {
+    char* endIndex;
+    long index = strtol(line + 9, &endIndex, 10);
+    if (*endIndex != '\0' || index < 1 || index > TEMP_COUNT) return;
+    updateTemperatures();
+    Serial.print(F("TEMP:"));
+    Serial.print(index);
+    Serial.print(':');
+    if (tempValid[index - 1]) Serial.println(tempC[index - 1], 2);
+    else Serial.println(F("ERR"));
   }
 }
 
@@ -118,6 +177,12 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(tachPins[0]), tach1ISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(tachPins[1]), tach2ISR, FALLING);
   lastRpmMs = millis();
+  for (uint8_t i = 0; i < TEMP_COUNT; ++i) {
+    tempSensors[i]->begin();
+    tempSensors[i]->setResolution(12);
+    tempSensors[i]->setWaitForConversion(false);
+  }
+  startTemperatureConversion(millis());
 }
 
 void loop() {
@@ -136,6 +201,7 @@ void loop() {
     }
   }
   updateRpm();
+  updateTemperatures();
   unsigned long now = millis();
   for (uint8_t i = 0; i < FAN_COUNT; ++i) {
     if ((unsigned long)(now - lastCommandMs[i]) > COMMAND_TIMEOUT_MS) {

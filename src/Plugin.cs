@@ -1,6 +1,7 @@
 ﻿using System;
 using System.IO;
 using System.IO.Ports;
+using System.Globalization;
 using System.Threading;
 using Microsoft.Win32;
 using FanControl.Plugins;
@@ -12,6 +13,7 @@ namespace FanControl.ArduinoInterface
         private SerialPort _serial;
         private ArduinoFanControlSensor[] _fans;
         private ArduinoRpmSensor[] _rpmSensors;
+        private ArduinoTemperatureSensor[] _temperatureSensors;
         private Timer _keepAliveTimer;
         private Timer _reconnectTimer;
 
@@ -55,7 +57,13 @@ namespace FanControl.ArduinoInterface
                     foreach (var sensor in _rpmSensors)
                         container.FanSensors.Add(sensor);
 
-                Log(_fans.Length + " controls and " + (_rpmSensors == null ? 0 : _rpmSensors.Length) + " RPM sensors loaded.");
+                if (_temperatureSensors != null)
+                    foreach (var sensor in _temperatureSensors)
+                        container.TempSensors.Add(sensor);
+
+                Log(_fans.Length + " controls, " + (_rpmSensors == null ? 0 : _rpmSensors.Length) +
+                    " RPM sensors and " + (_temperatureSensors == null ? 0 : _temperatureSensors.Length) +
+                    " temperature sensors loaded.");
             }
         }
 
@@ -137,6 +145,14 @@ namespace FanControl.ArduinoInterface
                             {
                                 new ArduinoRpmSensor("arduino_rpm_1", "Arduino FAN 1 RPM", 1, () => _serial, _serialLock),
                                 new ArduinoRpmSensor("arduino_rpm_2", "Arduino FAN 2 RPM", 2, () => _serial, _serialLock)
+                            };
+                        }
+                        if (_temperatureSensors == null)
+                        {
+                            _temperatureSensors = new ArduinoTemperatureSensor[]
+                            {
+                                new ArduinoTemperatureSensor("arduino_temp_1", "Arduino TEMP 1 (A1)", 1, () => _serial, _serialLock),
+                                new ArduinoTemperatureSensor("arduino_temp_2", "Arduino TEMP 2 (A2)", 2, () => _serial, _serialLock)
                             };
                         }
                         foreach (var fan in _fans)
@@ -443,6 +459,65 @@ namespace FanControl.ArduinoInterface
                         System.Globalization.CultureInfo.InvariantCulture,
                         out parsed) || parsed < 0 || parsed > 20000)
                         throw new IOException("Invalid RPM response: " + line);
+                    Value = parsed;
+                }
+                catch (Exception)
+                {
+                    Value = null;
+                }
+            }
+        }
+    }
+
+    // FanControl temperature source (degrees Celsius), one per DS18B20.
+    public class ArduinoTemperatureSensor : IPluginSensor
+    {
+        public string Id { get; }
+        public string Name { get; }
+        public float? Value { get; private set; }
+
+        private readonly int _number;
+        private readonly Func<SerialPort> _serialProvider;
+        private readonly object _lock;
+        private long _lastPollTicks;
+
+        public ArduinoTemperatureSensor(string id, string name, int number,
+            Func<SerialPort> serialProvider, object serialLock)
+        {
+            Id = id;
+            Name = name;
+            _number = number;
+            _serialProvider = serialProvider;
+            _lock = serialLock;
+            Value = null;
+        }
+
+        public void Update()
+        {
+            long now = DateTime.UtcNow.Ticks;
+            if (now - _lastPollTicks < TimeSpan.TicksPerSecond) return;
+            lock (_lock)
+            {
+                now = DateTime.UtcNow.Ticks;
+                if (now - _lastPollTicks < TimeSpan.TicksPerSecond) return;
+                _lastPollTicks = now;
+                SerialPort port = _serialProvider();
+                if (port == null || !port.IsOpen) { Value = null; return; }
+                try
+                {
+                    port.WriteLine("GET_TEMP:" + _number);
+                    string line = port.ReadLine().Trim();
+                    string prefix = "TEMP:" + _number + ":";
+                    if (!line.StartsWith(prefix, StringComparison.Ordinal))
+                        throw new IOException("Unexpected temperature response: " + line);
+                    string raw = line.Substring(prefix.Length);
+                    float parsed;
+                    if (!float.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) ||
+                        float.IsNaN(parsed) || float.IsInfinity(parsed) || parsed < -55f || parsed > 125f)
+                    {
+                        Value = null;
+                        return;
+                    }
                     Value = parsed;
                 }
                 catch (Exception)
