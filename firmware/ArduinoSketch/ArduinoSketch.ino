@@ -598,12 +598,12 @@ void updateOled() {
           const unsigned long measuredRpm = (unsigned long)(rpm[i] + 0.5f);
           // Maximum of 16 characters on the 128x64 U8x8 text display.
           if (measuredRpm <= 9999UL) {
-            snprintf(line, sizeof(line), "%u: %3u%% %4luRPM", (unsigned)(i + 1), percent, measuredRpm);
+            snprintf(line, sizeof(line), "%u: %3u%%  %4luRPM", (unsigned)(i + 1), percent, measuredRpm);
           } else {
-            snprintf(line, sizeof(line), "%u: %3u%% %5lu", (unsigned)(i + 1), percent, measuredRpm);
+            snprintf(line, sizeof(line), "%u: %3u%%  %5lu", (unsigned)(i + 1), percent, measuredRpm);
           }
         } else {
-          snprintf(line, sizeof(line), "%u: %3u%% %4sRPM", (unsigned)(i + 1), percent, "--");
+          snprintf(line, sizeof(line), "%u: %3u%%  %4sRPM", (unsigned)(i + 1), percent, "--");
         }
       } else {
         snprintf(line, sizeof(line), "%u: %3u%%", (unsigned)(i + 1), percent);
