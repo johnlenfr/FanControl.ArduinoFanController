@@ -1,4 +1,5 @@
 /*
+ * Development sketch v5: large RPM, 12V, and system pages; temperatures preserved.
  * FanControl Arduino Uno / Nano ATmega328P (16 MHz)
  * Five independent PWM controls, two TACH inputs.
  * PWM fan header pin 4 must be driven via one BC337 open collector PER FAN.
@@ -105,7 +106,7 @@ const uint8_t OLED_BUTTON_PIN = 4; // momentary switch between D4 and GND
 const unsigned long BUTTON_DEBOUNCE_MS = 35UL;
 const unsigned long BUTTON_LONG_MS = 900UL;
 const unsigned long OLED_REFRESH_MS = 600UL;
-const uint8_t OLED_PAGE_COUNT = 3;
+const uint8_t OLED_PAGE_COUNT = 7;
 const char FW_VERSION[] PROGMEM = "0.3.0-dev";
 const unsigned long MENU_TIMEOUT_MS = 30000UL;
 
@@ -150,6 +151,9 @@ uint8_t timeoutIndex = TIMEOUT_COUNT - 1;
 uint8_t oledPage = 0;
 unsigned long lastOledRefreshMs = 0;
 uint8_t oledRenderedPage = 255;
+uint8_t largeTempRenderedPage = 255;
+char largeTempRenderedText[9] = "";
+uint8_t largeStatusX = 255;
 uint32_t oledRowHash[8] = {0};
 bool oledDirty = true;
 bool lastButtonRaw = HIGH;
@@ -536,6 +540,88 @@ void drawOledTempRow(uint8_t row, uint8_t index) {
   } else snprintf(line, sizeof(line), "TEMP %u: --", (unsigned)(index + 1));
   drawOledRow(row, line);
 }
+// Eight characters to the right of the vertical separator on STATUS.
+// Typical values show T1 25.4C; larger/negative temperatures omit the C
+// rather than being truncated at the edge of the 16-column display.
+void drawStatusTemperature(char* dst, uint8_t index) {
+  if (!tempValid[index]) {
+    snprintf(dst, 9, "T%u --", (unsigned)(index + 1));
+    return;
+  }
+  char number[12];
+  dtostrf(tempC[index], 1, 1, number);
+  if (strlen(number) <= 4) {
+    snprintf(dst, 9, "T%u %sC", (unsigned)(index + 1), number);
+  } else if (strlen(number) <= 5) {
+    snprintf(dst, 9, "T%u %s", (unsigned)(index + 1), number);
+  } else {
+    snprintf(dst, 9, "T%u --", (unsigned)(index + 1));
+  }
+}
+
+// Large temperature page: seven 2x2 glyphs (14 OLED columns), plus
+// a normal-size apostrophe and C in the last two columns. U8x8 has only
+// 16 columns, so the full string cannot be rendered entirely in 2x2.
+// No framebuffer, and no full-screen clearing on periodic refresh.
+void renderLargeTemperature(uint8_t page, uint8_t sensor) {
+  char big[8];
+  bool showUnits = false;
+  if (tempValid[sensor]) {
+    char number[12];
+    dtostrf(tempC[sensor], 1, 1, number);
+    // 'T1 ' or 'T2 ' + up to four characters fits in seven 2x2 glyphs.
+    if (strlen(number) <= 4) {
+      snprintf(big, sizeof(big), "T%u %s", (unsigned)(sensor + 1), number);
+      showUnits = true;
+    } else {
+      snprintf(big, sizeof(big), "T%u --", (unsigned)(sensor + 1));
+    }
+  } else {
+    snprintf(big, sizeof(big), "T%u --", (unsigned)(sensor + 1));
+  }
+  char padded[8];
+  snprintf(padded, sizeof(padded), "%-7s", big);
+  // Include units in the comparison cache to avoid unnecessary I2C writes.
+  char current[10];
+  snprintf(current, sizeof(current), "%s%c", padded, showUnits ? 'C' : '-');
+  if (oledDirty || largeTempRenderedPage != page ||
+      strcmp(largeTempRenderedText, current) != 0) {
+    oled.draw2x2String(0, 3, padded);
+    oled.drawString(14, 3, showUnits ? "'C" : "  ");
+    strcpy(largeTempRenderedText, current);
+    largeTempRenderedPage = page;
+  }
+}
+
+// Reuse the existing U8x8 2x2 mode and cache for the three new
+// diagnostics pages. Never allocate a 1024-byte framebuffer.
+// Text is padded to erase previous digits without clearing every refresh.
+void renderLargeStatusText(uint8_t page, const char* value, bool centered = false) {
+  char padded[9];
+  if (centered) {
+    snprintf(padded, sizeof(padded), "%.8s", value);
+  } else {
+    snprintf(padded, sizeof(padded), "%-8.8s", value);
+  }
+  const uint8_t columns = (uint8_t)(strlen(padded) * 2U);
+  const uint8_t x = centered ? (uint8_t)((16U - columns) / 2U) : 0;
+  // The large glyphs occupy rows 2 and 3. Clear those rows only
+  // when the page or horizontal position changes, not on every refresh.
+  const bool moved = largeTempRenderedPage != page || largeStatusX != x;
+  if (oledDirty || moved || strcmp(largeTempRenderedText, padded) != 0) {
+    if (moved) {
+      oled.clearLine(2);
+      oled.clearLine(3);
+      oledRowHash[2] = 0;
+      oledRowHash[3] = 0;
+    }
+    oled.draw2x2String(x, 2, padded);
+    strcpy(largeTempRenderedText, padded);
+    largeTempRenderedPage = page;
+    largeStatusX = x;
+  }
+}
+
 void drawTimeoutChoice(uint8_t row, uint8_t index) {
   char text[17];
   unsigned long secs = pgm_read_dword(&timeoutSeconds[index]);
@@ -559,6 +645,20 @@ void updateOled() {
   if ((unsigned long)(now - lastOledRefreshMs) < OLED_REFRESH_MS) return;
   lastOledRefreshMs = now;
   char line[17];
+  // A double-size glyph bypasses the normal row-hash cache.
+  // When leaving a large display, invalidate all potentially covered rows.
+  const bool showingLargeDisplay = (uiMode == UI_PAGES && oledPage >= 1 && oledPage <= 6);
+  if (!showingLargeDisplay && largeTempRenderedPage != 255) {
+    oled.clearLine(2);
+    oled.clearLine(3);
+    oled.clearLine(4);
+    oledRowHash[2] = 0;
+    oledRowHash[3] = 0;
+    oledRowHash[4] = 0;
+    largeTempRenderedPage = 255;
+    largeStatusX = 255;
+    largeTempRenderedText[0] = '\0';
+  }
   // Redraw all 8 rows logically, including blanks. Only changed rows
   // are actually sent over I2C. This prevents stale text between views.
   if (uiMode == UI_MENU) {
@@ -632,7 +732,7 @@ void updateOled() {
     OLED_TEXT(6, "SHORT: SELECT");
     OLED_TEXT(7, "LONG: CONFIRM");
   } else if (oledPage == 0) {
-    OLED_TEXT(0, "FANS STATUS  1/3");
+    OLED_TEXT(0, "STATUS       1/7");
     OLED_TEXT(1, "");
     for (uint8_t i = 0; i < FAN_COUNT; ++i) {
       // Round PWM duty cycle to the nearest whole percent (0..100).
@@ -650,44 +750,81 @@ void updateOled() {
         } else {
           snprintf(line, sizeof(line), "%u: %3u%%  %4sRPM", (unsigned)(i + 1), percent, "--");
         }
+      } else if (i == 3 || i == 4) {
+        // FAN 4/5 on the left, temperatures on the right.
+        // '|' remains at column 8 (index 7) for both PWM values.
+        char tempText[9];
+        drawStatusTemperature(tempText, i - 3);
+        snprintf(line, sizeof(line), "%u: %3u%%|%-8s",
+                 (unsigned)(i + 1), percent, tempText);
       } else {
         snprintf(line, sizeof(line), "%u: %3u%%", (unsigned)(i + 1), percent);
       }
       drawOledRow(i + 2, line);
     }
     OLED_TEXT(7, "MENU: LONG PRESS");
-  } else if (oledPage == 1) {
-    OLED_TEXT(0, "TEMPERATURES 2/3"); OLED_TEXT(1, "");
-    drawOledTempRow(2, 0); OLED_TEXT(3, ""); drawOledTempRow(4, 1);
-    OLED_TEXT(5, ""); OLED_TEXT(6, "");
-    OLED_TEXT(7, "MENU: LONG PRESS");
-  } else {
-    OLED_TEXT(0, "SETTINGS     3/3"); OLED_TEXT(1, "");
-    bool recentRx = serialCommandSeen &&
-      (unsigned long)(now - lastSerialCommandMs) <= COMMAND_TIMEOUT_MS;
+  } else if (oledPage == 1 || oledPage == 2) {
+    const uint8_t sensor = oledPage - 1;
+    if (sensor == 0) OLED_TEXT(0, "TEMP 1       2/7");
+    else OLED_TEXT(0, "TEMP 2       3/7");
+    OLED_TEXT(1, "");
     OLED_TEXT(2, "");
-    drawOledFlash(2, recentRx ? F("SERIAL: ACTIVE") : F("SERIAL: NO RX"));
-    if (serialCommandSeen) {
-      unsigned long seconds = (now - lastSerialCommandMs) / 1000UL;
-      if (seconds > 999UL) seconds = 999UL;
-      snprintf(line, sizeof(line), "LAST RX: %lus", seconds);
-      drawOledRow(3, line);
-    } else OLED_TEXT(3, "LAST RX: --");
-    snprintf(line, sizeof(line), "PWM SAFE: %u%%", failsafePercent);
-    drawOledRow(4, line);
-    if (supplyReadingReady) {
-      // One decimal digit; -- before the first conversion.
-      uint16_t tenths = (uint16_t)((supplyMillivolts + 50U) / 100U);
-      snprintf(line, sizeof(line), "12V INPUT: %u.%uV",
-               (unsigned)(tenths / 10U), (unsigned)(tenths % 10U));
-      drawOledRow(5, line);
-    } else {
-      OLED_TEXT(5, "12V INPUT: --");
+    // Do not call drawOledRow(3/4): these rows hold double-size glyphs.
+    OLED_TEXT(5, "");
+    OLED_TEXT(6, "");
+    OLED_TEXT(7, "MENU: LONG PRESS");
+    // Explicitly clear the big characters if switching sensor pages.
+    if (largeTempRenderedPage != oledPage) {
+      oled.clearLine(3);
+      oled.clearLine(4);
+      oledRowHash[3] = 0;
+      oledRowHash[4] = 0;
     }
-    // Diagnostic: estimated free SRAM between heap and stack.
-    // Updated only with the usual OLED refresh, without delays.
-    const int availableRam = freeRam();
-    snprintf(line, sizeof(line), "FREE RAM: %dB", availableRam);
+    renderLargeTemperature(oledPage, sensor);
+  } else if (oledPage == 3 || oledPage == 4) {
+    const uint8_t channel = oledPage - 3;
+    if (channel == 0) OLED_TEXT(0, "FAN 1 RPM    4/7");
+    else OLED_TEXT(0, "FAN 2 RPM    5/7");
+    OLED_TEXT(1, "");
+    // Rows 2-3 are reserved for large characters, raised by one row.
+    OLED_TEXT(4, "");
+    OLED_TEXT(5, "      RPM");
+    OLED_TEXT(6, ""); OLED_TEXT(7, "MENU: LONG PRESS");
+    char big[9];
+    if (!rpmWindowReady) {
+      snprintf(big, sizeof(big), "R%u --", (unsigned)(channel + 1));
+    } else {
+      unsigned long value = (unsigned long)(rpm[channel] + 0.5f);
+      if (value <= 99999UL) snprintf(big, sizeof(big), "R%u %lu", (unsigned)(channel + 1), value);
+      else snprintf(big, sizeof(big), "R%u --", (unsigned)(channel + 1));
+    }
+    renderLargeStatusText(oledPage, big);
+  } else if (oledPage == 5) {
+    OLED_TEXT(0, "POWER INPUT  6/7");
+    OLED_TEXT(1, "");
+    OLED_TEXT(4, "");
+    OLED_TEXT(6, ""); OLED_TEXT(7, "MENU: LONG PRESS");
+    char big[9];
+    if (supplyReadingReady) {
+      uint16_t tenths = (uint16_t)((supplyMillivolts + 50U) / 100U);
+      snprintf(big, sizeof(big), "%u.%uV", (unsigned)(tenths / 10U),
+               (unsigned)(tenths % 10U));
+    } else strcpy(big, "--");
+    renderLargeStatusText(oledPage, big, true);
+    snprintf(line, sizeof(line), "ADC VREF: %u.%03uV",
+             (unsigned)(adcReferenceMv / 1000U),
+             (unsigned)(adcReferenceMv % 1000U));
+    drawOledRow(5, line);
+  } else if (oledPage == 6) {
+    OLED_TEXT(0, "SYSTEM STATUS7/7");
+    OLED_TEXT(1, "");
+    OLED_TEXT(4, "");
+    const bool recentRx = serialCommandSeen &&
+      (unsigned long)(now - lastSerialCommandMs) <= COMMAND_TIMEOUT_MS;
+    renderLargeStatusText(oledPage, recentRx ? "ONLINE" : "NO RX", true);
+    snprintf(line, sizeof(line), "PWM SAFE: %u%%", (unsigned)failsafePercent);
+    drawOledRow(5, line);
+    snprintf(line, sizeof(line), "FREE RAM: %dB", freeRam());
     drawOledRow(6, line);
     OLED_TEXT(7, "MENU: LONG PRESS");
   }
