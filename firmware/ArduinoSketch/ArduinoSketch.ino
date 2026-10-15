@@ -20,6 +20,9 @@
 // Mettre cette valeur a 0 pour ne pas compiler Wire/U8x8 et l'interface OLED.
 #define ENABLE_OLED 1
 
+// 1 = D13 onboard status LED; 0 = no status LED code.
+#define ENABLE_STATUS_LED 1
+
 #include <Arduino.h>
 #include <string.h>
 #include <stdlib.h>
@@ -31,6 +34,40 @@
 #endif
 #include <EEPROM.h>
 #include <avr/pgmspace.h>
+
+#if ENABLE_STATUS_LED
+// D13 is the Nano onboard LED (also SCK: do not use external SPI on D13).
+const uint8_t STATUS_LED_PIN = LED_BUILTIN;
+const unsigned long STATUS_HEARTBEAT_MS = 3000UL;
+const unsigned long STATUS_PULSE_MS = 80UL;
+const unsigned long STATUS_ALARM_CYCLE_MS = 1000UL;
+// Two 90-ms flashes, at t=0..90 and t=210..300 ms.
+const unsigned long STATUS_ALARM_PULSE_MS = 90UL;
+const unsigned long STATUS_ALARM_SECOND_MS = 210UL;
+unsigned long lastValidCommandMs = 0;
+bool validCommandSeen = false;
+
+void noteValidSerialCommand() {
+  lastValidCommandMs = millis();
+  validCommandSeen = true;
+}
+
+void updateStatusLed() {
+  const unsigned long now = millis();
+  bool on = false;
+  if (validCommandSeen) {
+    if ((unsigned long)(now - lastValidCommandMs) > 5000UL) {
+      const unsigned long phase = now % STATUS_ALARM_CYCLE_MS;
+      on = phase < STATUS_ALARM_PULSE_MS ||
+           (phase >= STATUS_ALARM_SECOND_MS &&
+            phase < STATUS_ALARM_SECOND_MS + STATUS_ALARM_PULSE_MS);
+    } else {
+      on = (now % STATUS_HEARTBEAT_MS) < STATUS_PULSE_MS;
+    }
+  }
+  digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
+}
+#endif
 
 const uint8_t FAN_COUNT = 5;
 const uint8_t fanPins[FAN_COUNT] = {5, 6, 9, 10, 11};
@@ -135,7 +172,15 @@ uint8_t oledMenuIndex = 0;
 uint8_t choiceIndex = 0;
 uint16_t vrefChoiceMv = VREF_DEFAULT_MV;
 
+// Explicit prototypes for functions whose argument uses a custom enum.
+// Arduino IDE may otherwise generate prototypes before the enum is declared.
+void beginChoices(ChoiceKind kind);
 #endif
+
+// Explicit prototypes for functions whose argument uses a custom struct.
+// Prevent Arduino IDE auto-prototypes from preceding the struct definitions.
+uint8_t settingsCheck(const StoredSettings& s);
+uint8_t settingsCheckV2(const StoredSettingsV2& s);
 
 uint8_t settingsCheck(const StoredSettings& s) {
   return (uint8_t)(0xA7 ^ s.magic1 ^ s.magic2 ^ s.version ^
@@ -658,10 +703,19 @@ void processCommand(char* line) {
   serialCommandSeen = true;
 #endif
   if (strcmp(line, "PING") == 0) {
+#if ENABLE_STATUS_LED
+    noteValidSerialCommand();
+#endif
     Serial.println(F("PONG"));
   } else if (strcmp(line, "NUM_FANS") == 0) {
+#if ENABLE_STATUS_LED
+    noteValidSerialCommand();
+#endif
     Serial.println(FAN_COUNT);
   } else if (strcmp(line, "FAN_NAMES") == 0) {
+#if ENABLE_STATUS_LED
+    noteValidSerialCommand();
+#endif
     Serial.println(F("Arduino FAN 1 PWM"));
     Serial.println(F("Arduino FAN 2 PWM"));
     Serial.println(F("Arduino FAN 3 PWM"));
@@ -675,12 +729,18 @@ void processCommand(char* line) {
     long val = strtol(endIndex + 1, &endValue, 10);
     if (*endValue != '\0' || index < 1 || index > FAN_COUNT || val < 0 || val > 255) return;
     applyPWM((uint8_t)(index - 1), (uint8_t)val);
+#if ENABLE_STATUS_LED
+    noteValidSerialCommand();
+#endif
     lastCommandMs[index - 1] = millis();
   } else if (strncmp(line, "GET_RPM:", 8) == 0) {
     char* endIndex;
     long index = strtol(line + 8, &endIndex, 10);
     if (*endIndex != '\0' || index < 1 || index > FAN_COUNT) return;
     updateRpm();
+#if ENABLE_STATUS_LED
+    noteValidSerialCommand();
+#endif
     Serial.print(F("RPM:"));
     Serial.print(index);
     Serial.print(':');
@@ -691,6 +751,9 @@ void processCommand(char* line) {
     long index = strtol(line + 9, &endIndex, 10);
     if (*endIndex != '\0' || index < 1 || index > TEMP_COUNT) return;
     updateTemperatures();
+#if ENABLE_STATUS_LED
+    noteValidSerialCommand();
+#endif
     Serial.print(F("TEMP:"));
     Serial.print(index);
     Serial.print(':');
@@ -700,6 +763,10 @@ void processCommand(char* line) {
 }
 
 void setup() {
+#if ENABLE_STATUS_LED
+  digitalWrite(STATUS_LED_PIN, LOW);
+  pinMode(STATUS_LED_PIN, OUTPUT);
+#endif
   Serial.begin(115200);
   loadSettings();
 #if ENABLE_OLED
@@ -759,6 +826,9 @@ void loop() {
     }
   }
   updateSupplyVoltage();
+#if ENABLE_STATUS_LED
+  updateStatusLed();
+#endif
   // OLED last: priority to serial commands, RPM and fail-safe.
 #if ENABLE_OLED
   updateMenuTimeout();
