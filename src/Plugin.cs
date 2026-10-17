@@ -187,50 +187,89 @@ namespace FanControl.ArduinoInterface
         );
 
         private string FindArduinoPort()
+{
+    string[] ports = SerialPort.GetPortNames();
+    Array.Sort(ports, StringComparer.OrdinalIgnoreCase);
+
+    Log("Available serial ports: " + string.Join(", ", ports));
+
+    // Port de secours facultatif : testé en premier,
+    // mais jamais accepté sans réponse PONG.
+    string preferredPort = null;
+
+    try
+    {
+        string path = Path.Combine(
+            UserDataDirectory, "arduino_port.txt");
+
+        if (File.Exists(path))
+            preferredPort = File.ReadAllText(path).Trim();
+    }
+    catch (Exception ex)
+    {
+        Log("Fallback port configuration error: " + ex.Message);
+    }
+
+    var candidates = new System.Collections.Generic.List<string>();
+
+    if (!string.IsNullOrWhiteSpace(preferredPort) &&
+        Array.Exists(ports, p => string.Equals(
+            p, preferredPort, StringComparison.OrdinalIgnoreCase)))
+    {
+        candidates.Add(preferredPort);
+    }
+
+    foreach (string port in ports)
+    {
+        if (!candidates.Exists(p => string.Equals(
+            p, port, StringComparison.OrdinalIgnoreCase)))
         {
-            string autoPort = DetectArduinoUsbPort();
-            if (!string.IsNullOrWhiteSpace(autoPort))
-            {
-                Log("USB auto-detection: " + autoPort);
-                return autoPort;
-            }
+            candidates.Add(port);
+        }
+    }
 
-            try
+    foreach (string port in candidates)
+    {
+        try
+        {
+            Log("Probing Arduino on " + port);
+
+            using (var probe = new SerialPort(port, BaudRate))
             {
-                // Only the per-user fallback port file is supported.
-                // Never read a legacy file from the FanControl Plugins directory.
-                string path = Path.Combine(UserDataDirectory, "arduino_port.txt");
-                if (!File.Exists(path))
+                probe.DtrEnable = true;
+                probe.NewLine = "\n";
+                probe.ReadTimeout = ReadTimeoutMs;
+                probe.WriteTimeout = WriteTimeoutMs;
+
+                probe.Open();
+
+                // Le Nano peut redémarrer à l'ouverture du port.
+                Thread.Sleep(StartupDelayMs);
+
+                probe.DiscardInBuffer();
+                probe.WriteLine("PING");
+
+                string response = probe.ReadLine().Trim();
+
+                if (response == "PONG")
                 {
-                    Log("No USB Arduino found and no fallback port file at " + path);
-                    return null;
+                    Log("Arduino detected automatically on " + port);
+                    return port;
                 }
 
-                string port = File.ReadAllText(path).Trim();
-                if (string.IsNullOrWhiteSpace(port))
-                {
-                    Log("Configured port file is empty: " + path);
-                    return null;
-                }
-
-                // Fail early on stale configurations, rather than trying an
-                // unavailable COM port repeatedly.
-                if (!Array.Exists(SerialPort.GetPortNames(),
-                    p => string.Equals(p, port, StringComparison.OrdinalIgnoreCase)))
-                {
-                    Log("Configured COM port is not available: " + port + " (" + path + ")");
-                    return null;
-                }
-
-                Log("Using configured fallback port: " + port + " from " + path);
-                return port;
-            }
-            catch (Exception ex)
-            {
-                Log("Port configuration error: " + ex.Message);
-                return null;
+                Log("Unexpected response on " + port +
+                    ": " + response);
             }
         }
+        catch (Exception ex)
+        {
+            Log("Port " + port + " probe failed: " + ex.Message);
+        }
+    }
+
+    Log("No compatible Arduino detected on any COM port.");
+    return null;
+}
 
         private string DetectArduinoUsbPort()
         {
