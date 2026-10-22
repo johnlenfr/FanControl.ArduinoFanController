@@ -133,9 +133,21 @@ struct StoredSettingsV2 {
   uint8_t check;
   uint16_t vrefMv;
 };
+struct StoredSettingsV3 {
+  uint8_t magic1;
+  uint8_t magic2;
+  uint8_t version;
+  uint8_t failsafe;
+  uint8_t brightness;
+  uint8_t timeout;
+  uint8_t check;
+  uint16_t vrefMv;
+  uint8_t rotation;     // 0 = normal, 1 = 180 degrees
+};
 const uint8_t EEPROM_MAGIC1 = 0xF3;
 const uint8_t EEPROM_MAGIC2 = 0x62;
-const uint8_t EEPROM_FORMAT = 2;
+// v3 adds OLED rotation, while preserving v1/v2 migration.
+const uint8_t EEPROM_FORMAT = 3;
 const uint8_t failsafeChoices[] = {20, 30, 40, 50, 60, 70, 80, 90, 100};
 const uint8_t brightnessChoices[] = {10, 25, 50, 75, 100};
 const uint8_t contrastTable[] = {12, 40, 96, 170, 255};
@@ -146,6 +158,7 @@ const unsigned long timeoutSeconds[] PROGMEM = {
 const uint8_t TIMEOUT_COUNT = sizeof(timeoutSeconds) / sizeof(timeoutSeconds[0]);
 uint8_t brightnessIndex = 3;
 uint8_t timeoutIndex = TIMEOUT_COUNT - 1;
+uint8_t oledRotation = 0;
 
 #if ENABLE_OLED
 uint8_t oledPage = 0;
@@ -168,7 +181,7 @@ unsigned long lastSerialCommandMs = 0;
 bool serialCommandSeen = false;
 
 enum UiMode : uint8_t { UI_PAGES, UI_MENU, UI_OLED_MENU, UI_CHOICES, UI_FW_INFO };
-enum ChoiceKind : uint8_t { CHOICE_FAILSAFE, CHOICE_BRIGHTNESS, CHOICE_TIMEOUT, CHOICE_VREF };
+enum ChoiceKind : uint8_t { CHOICE_FAILSAFE, CHOICE_BRIGHTNESS, CHOICE_TIMEOUT, CHOICE_VREF, CHOICE_ROTATION };
 UiMode uiMode = UI_PAGES;
 ChoiceKind choiceKind = CHOICE_FAILSAFE;
 uint8_t menuIndex = 0;
@@ -185,6 +198,7 @@ void beginChoices(ChoiceKind kind);
 // Prevent Arduino IDE auto-prototypes from preceding the struct definitions.
 uint8_t settingsCheck(const StoredSettings& s);
 uint8_t settingsCheckV2(const StoredSettingsV2& s);
+uint8_t settingsCheckV3(const StoredSettingsV3& s);
 
 uint8_t settingsCheck(const StoredSettings& s) {
   return (uint8_t)(0xA7 ^ s.magic1 ^ s.magic2 ^ s.version ^
@@ -194,6 +208,12 @@ uint8_t settingsCheckV2(const StoredSettingsV2& s) {
   return (uint8_t)(0xA7 ^ s.magic1 ^ s.magic2 ^ s.version ^
                    s.failsafe ^ s.brightness ^ s.timeout ^
                    (uint8_t)s.vrefMv ^ (uint8_t)(s.vrefMv >> 8));
+}
+uint8_t settingsCheckV3(const StoredSettingsV3& s) {
+  // Include rotation in checksum; layout is deliberately appended to v2.
+  return (uint8_t)(0xA7 ^ s.magic1 ^ s.magic2 ^ s.version ^
+                   s.failsafe ^ s.brightness ^ s.timeout ^
+                   (uint8_t)s.vrefMv ^ (uint8_t)(s.vrefMv >> 8) ^ s.rotation);
 }
 bool settingsValuesValid(uint8_t failsafe, uint8_t brightness, uint8_t timeout) {
   return failsafe >= 20 && failsafe <= 100 &&
@@ -209,6 +229,20 @@ void loadSettings() {
   if (s.magic1 == EEPROM_MAGIC1 && s.magic2 == EEPROM_MAGIC2 &&
       settingsValuesValid(s.failsafe, s.brightness, s.timeout)) {
     if (s.version == EEPROM_FORMAT) {
+      StoredSettingsV3 v3;
+      EEPROM.get(0, v3);
+      if (v3.check == settingsCheckV3(v3) &&
+          v3.vrefMv >= VREF_MIN_MV && v3.vrefMv <= VREF_MAX_MV &&
+          (v3.vrefMv % VREF_STEP_MV) == 0 && v3.rotation <= 1) {
+        setFailsafePercent(v3.failsafe);
+        brightnessIndex = v3.brightness;
+        timeoutIndex = v3.timeout;
+        adcReferenceMv = v3.vrefMv;
+        oledRotation = v3.rotation;
+        return;
+      }
+    } else if (s.version == 2) {
+      // Migrate v2 without discarding its ADC calibration.
       StoredSettingsV2 v2;
       EEPROM.get(0, v2);
       if (v2.check == settingsCheckV2(v2) &&
@@ -218,6 +252,7 @@ void loadSettings() {
         brightnessIndex = v2.brightness;
         timeoutIndex = v2.timeout;
         adcReferenceMv = v2.vrefMv;
+        oledRotation = 0;
         return;
       }
     } else if (s.version == 1 && s.check == settingsCheck(s)) {
@@ -233,12 +268,13 @@ void loadSettings() {
   brightnessIndex = 3;
   timeoutIndex = TIMEOUT_COUNT - 1;
   adcReferenceMv = VREF_DEFAULT_MV;
+  oledRotation = 0;
 }
 void saveSettings() {
-  StoredSettingsV2 s = {EEPROM_MAGIC1, EEPROM_MAGIC2, EEPROM_FORMAT,
+  StoredSettingsV3 s = {EEPROM_MAGIC1, EEPROM_MAGIC2, EEPROM_FORMAT,
                         failsafePercent, brightnessIndex, timeoutIndex, 0,
-                        adcReferenceMv};
-  s.check = settingsCheckV2(s);
+                        adcReferenceMv, oledRotation};
+  s.check = settingsCheckV3(s);
   const uint8_t* p = (const uint8_t*)&s;
   // Write version LAST: interrupted writes cannot validate as v2.
   for (uint8_t i = 0; i < sizeof(s); ++i) {
@@ -253,6 +289,16 @@ void forceOledRedraw() {
 }
 void applyBrightness() {
   oled.setContrast(contrastTable[brightnessIndex]);
+}
+void applyOledRotation() {
+  oled.setFlipMode(oledRotation); // U8x8: 0 = 0 degrees, 1 = 180 degrees.
+  oled.clearDisplay();
+  for (uint8_t i = 0; i < 8; ++i) oledRowHash[i] = 0;
+  largeTempRenderedPage = 255;
+  largeTempRenderedText[0] = '\0';
+  largeStatusX = 255;
+  oledRenderedPage = 255;
+  forceOledRedraw();
 }
 void wakeOled() {
   if (!oledAwake) {
@@ -390,6 +436,7 @@ void updateTemperatures() {
 uint8_t choiceCount() {
   if (choiceKind == CHOICE_FAILSAFE) return sizeof(failsafeChoices);
   if (choiceKind == CHOICE_BRIGHTNESS) return sizeof(brightnessChoices);
+  if (choiceKind == CHOICE_ROTATION) return 2;
   if (choiceKind == CHOICE_VREF) return (VREF_MAX_MV - VREF_MIN_MV) / VREF_STEP_MV + 1;
   return TIMEOUT_COUNT;
 }
@@ -398,7 +445,7 @@ void shortPress() {
   switch (uiMode) {
     case UI_PAGES: oledPage = (uint8_t)((oledPage + 1) % OLED_PAGE_COUNT); break;
     case UI_MENU: menuIndex = (uint8_t)((menuIndex + 1) % 5); break;
-    case UI_OLED_MENU: oledMenuIndex = (uint8_t)((oledMenuIndex + 1) % 3); break;
+    case UI_OLED_MENU: oledMenuIndex = (uint8_t)((oledMenuIndex + 1) % 4); break;
     case UI_CHOICES:
       if (choiceKind == CHOICE_VREF) {
         vrefChoiceMv += VREF_STEP_MV;
@@ -419,6 +466,7 @@ void beginChoices(ChoiceKind kind) {
     for (uint8_t i = 0; i < choiceCount(); ++i)
       if (failsafeChoices[i] == failsafePercent) choiceIndex = i;
   } else if (kind == CHOICE_BRIGHTNESS) choiceIndex = brightnessIndex;
+  else if (kind == CHOICE_ROTATION) choiceIndex = oledRotation;
   else choiceIndex = timeoutIndex;
 }
 void applyPWM(uint8_t channel, uint8_t value);
@@ -438,6 +486,7 @@ void longPress() {
   } else if (uiMode == UI_OLED_MENU) {
     if (oledMenuIndex == 0) beginChoices(CHOICE_BRIGHTNESS);
     else if (oledMenuIndex == 1) beginChoices(CHOICE_TIMEOUT);
+    else if (oledMenuIndex == 2) beginChoices(CHOICE_ROTATION);
     else uiMode = UI_MENU;
   } else if (uiMode == UI_CHOICES) {
     if (choiceKind == CHOICE_FAILSAFE) {
@@ -456,6 +505,10 @@ void longPress() {
       uiMode = UI_OLED_MENU;
     } else if (choiceKind == CHOICE_TIMEOUT) {
       timeoutIndex = choiceIndex;
+      uiMode = UI_OLED_MENU;
+    } else if (choiceKind == CHOICE_ROTATION) {
+      oledRotation = choiceIndex;
+      applyOledRotation();
       uiMode = UI_OLED_MENU;
     } else {
       adcReferenceMv = vrefChoiceMv;
@@ -686,14 +739,14 @@ void updateOled() {
   } else if (uiMode == UI_OLED_MENU) {
     OLED_TEXT(0, " OLED SETTINGS ");
     OLED_TEXT(1, "");
-    for (uint8_t i = 0; i < 3; ++i) {
-      const __FlashStringHelper* label = i == 0 ? F("BRIGHTNESS") : (i == 1 ? F("AUTO OFF") : F("BACK"));
+    for (uint8_t i = 0; i < 4; ++i) {
+      const __FlashStringHelper* label = i == 0 ? F("BRIGHTNESS") :
+          (i == 1 ? F("AUTO OFF") : (i == 2 ? F("ROTATION") : F("BACK")));
       char text[17];
       strncpy_P(text + 2, (PGM_P)label, 14);
       text[16] = '\0'; text[0] = oledMenuIndex == i ? '>' : ' '; text[1] = ' ';
       drawOledRow(i + 2, text);
     }
-    OLED_TEXT(5, "");
     OLED_TEXT(6, "SHORT: SELECT");
     OLED_TEXT(7, "LONG: ENTER");
   } else if (uiMode == UI_FW_INFO) {
@@ -720,6 +773,9 @@ void updateOled() {
     } else if (choiceKind == CHOICE_TIMEOUT) {
       OLED_TEXT(0, " OLED AUTO OFF  ");
       drawTimeoutChoice(3, choiceIndex);
+    } else if (choiceKind == CHOICE_ROTATION) {
+      OLED_TEXT(0, " OLED ROTATION  ");
+      drawOledRow(3, choiceIndex == 0 ? "> 0 deg" : "> 180 deg");
     } else {
       OLED_TEXT(0, "    ADC VREF    ");
       snprintf(line, sizeof(line), "> %u.%03u V",
@@ -912,6 +968,7 @@ void setup() {
   oled.begin();
   oled.setPowerSave(0);
   oled.setFont(u8x8_font_chroma48medium8_r);
+  applyOledRotation();
   applyBrightness();
   lastUserInteractionMs = millis();
   oled.drawString(0, 0, "FanControl Nano");
